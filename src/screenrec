@@ -1,0 +1,273 @@
+#!/usr/bin/python3
+"""Screen Recorder: screen (via the desktop portal) + computer sound + microphone."""
+import datetime
+import os
+import subprocess
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gst", "1.0")
+from gi.repository import Gio, GLib, Gst, Gtk
+
+Gst.init(None)
+
+PORTAL = "org.freedesktop.portal.Desktop"
+PORTAL_PATH = "/org/freedesktop/portal/desktop"
+SCREENCAST = "org.freedesktop.portal.ScreenCast"
+REQUEST = "org.freedesktop.portal.Request"
+SESSION = "org.freedesktop.portal.Session"
+
+# GStreamer parts the recorder needs. We check them at startup.
+NEEDED = ["pipewiresrc", "videoconvert", "videorate", "x264enc", "h264parse",
+          "pulsesrc", "audiomixer", "audioconvert", "audioresample",
+          "opusenc", "matroskamux", "filesink", "queue"]
+
+
+def pactl(*args):
+    """Run a pactl command and return its output ('' if it fails)."""
+    try:
+        return subprocess.check_output(["pactl", *args], text=True).strip()
+    except Exception:
+        return ""
+
+
+# ---------- Part 1: ask the desktop for the screen ----------
+class ScreenCastPortal:
+    def __init__(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.sender = self.bus.get_unique_name()[1:].replace(".", "_")
+        self.session = None
+        self.counter = 0
+
+    def _call(self, method, args, options, on_response, on_error):
+        """Call a portal method and wait for its Response signal."""
+        self.counter += 1
+        token = f"screenrec{os.getpid()}_{self.counter}"
+        options["handle_token"] = GLib.Variant("s", token)
+        req_path = f"/org/freedesktop/portal/desktop/request/{self.sender}/{token}"
+        sub = [None]
+
+        def on_signal(conn, sender, path, iface, signal, params, *_):
+            self.bus.signal_unsubscribe(sub[0])
+            code, results = params.unpack()
+            on_response(code, results)
+
+        sub[0] = self.bus.signal_subscribe(
+            PORTAL, REQUEST, "Response", req_path, None,
+            Gio.DBusSignalFlags.NONE, on_signal)
+
+        def on_reply(bus, res):
+            try:
+                bus.call_finish(res)
+            except GLib.Error as e:
+                self.bus.signal_unsubscribe(sub[0])
+                on_error(e.message)
+
+        params = GLib.Variant.new_tuple(*args, GLib.Variant("a{sv}", options))
+        self.bus.call(PORTAL, PORTAL_PATH, SCREENCAST, method, params,
+                      None, Gio.DBusCallFlags.NONE, -1, None, on_reply)
+
+    def start(self, on_ready, on_error):
+        def created(code, res):
+            if code != 0:
+                return on_error("Could not start a capture session.")
+            self.session = res["session_handle"]
+            self._call("SelectSources",
+                       [GLib.Variant("o", self.session)],
+                       {"types": GLib.Variant("u", 3),        # screens + windows
+                        "multiple": GLib.Variant("b", False),
+                        "cursor_mode": GLib.Variant("u", 2)},  # draw the cursor
+                       selected, on_error)
+
+        def selected(code, res):
+            if code != 0:
+                return on_error("Could not select a source.")
+            self._call("Start",
+                       [GLib.Variant("o", self.session), GLib.Variant("s", "")],
+                       {}, started, on_error)
+
+        def started(code, res):
+            if code != 0:
+                return on_error("Sharing was cancelled.")
+            node = res["streams"][0][0]
+            try:
+                on_ready(self._open_remote(), node)
+            except GLib.Error as e:
+                on_error(e.message)
+
+        self._call("CreateSession", [],
+                   {"session_handle_token": GLib.Variant("s", f"screenrec{os.getpid()}")},
+                   created, on_error)
+
+    def _open_remote(self):
+        params = GLib.Variant("(oa{sv})", (self.session, {}))
+        res, fds = self.bus.call_with_unix_fd_list_sync(
+            PORTAL, PORTAL_PATH, SCREENCAST, "OpenPipeWireRemote", params,
+            GLib.VariantType("(h)"), Gio.DBusCallFlags.NONE, -1, None, None)
+        return fds.get(res.unpack()[0])
+
+    def close(self):
+        if self.session:
+            self.bus.call(PORTAL, self.session, SESSION, "Close", None, None,
+                          Gio.DBusCallFlags.NONE, -1, None, None)
+            self.session = None
+
+
+# ---------- Part 2: record with GStreamer ----------
+class Recorder:
+    def __init__(self, on_done):
+        self.on_done = on_done
+        self.pipeline = None
+        self.outfile = None
+
+    def start(self, fd, node, system_sound, mic):
+        folder = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_VIDEOS) \
+            or os.path.expanduser("~")
+        name = datetime.datetime.now().strftime("screen-%Y-%m-%d_%H-%M-%S.mkv")
+        self.outfile = os.path.join(folder, name)
+
+        parts = [
+            f'matroskamux name=mux ! filesink location="{self.outfile}"',
+            f"pipewiresrc fd={fd} path={node} do-timestamp=true ! videoconvert "
+            "! videorate ! video/x-raw,framerate=30/1 ! queue "
+            "! x264enc tune=zerolatency speed-preset=veryfast bitrate=4000 "
+            "! h264parse ! queue ! mux.",
+        ]
+
+        sources = []
+        if system_sound:
+            sink = pactl("get-default-sink")
+            if sink:
+                sources.append(f'pulsesrc device="{sink}.monitor"')
+        if mic:
+            sources.append("pulsesrc")  # default microphone
+
+        if sources:
+            parts.append("audiomixer name=mix ! audioconvert ! audioresample "
+                         "! opusenc ! queue ! mux.")
+            for src in sources:
+                parts.append(f"{src} ! audioconvert ! audioresample "
+                             "! audio/x-raw,rate=48000,channels=2 ! queue ! mix.")
+
+        self.pipeline = Gst.parse_launch(" ".join(parts))
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_message)
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+    def stop(self):
+        # EOS tells GStreamer to finish writing the file properly.
+        self.pipeline.send_event(Gst.Event.new_eos())
+        GLib.timeout_add_seconds(5, self._force_finish)
+
+    def _force_finish(self):
+        self._finish(None)
+        return False
+
+    def _on_message(self, bus, msg):
+        if msg.type == Gst.MessageType.EOS:
+            self._finish(None)
+        elif msg.type == Gst.MessageType.ERROR:
+            err, _ = msg.parse_error()
+            self._finish(err.message)
+
+    def _finish(self, error):
+        if not self.pipeline:
+            return
+        self.pipeline.get_bus().remove_signal_watch()
+        self.pipeline.set_state(Gst.State.NULL)
+        self.pipeline = None
+        self.on_done(self.outfile, error)
+
+
+# ---------- Part 3: the window ----------
+class App(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Screen Recorder")
+        self.set_default_size(340, -1)
+        self.set_border_width(16)
+        self.recording = False
+        self.seconds = 0
+        self.timer_id = None
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.sys_check = Gtk.CheckButton(label="Computer sound")
+        self.sys_check.set_active(True)
+        self.mic_check = Gtk.CheckButton(label="Microphone")
+        self.button = Gtk.Button(label="Start recording")
+        self.status = Gtk.Label(label="Ready", xalign=0)
+        self.status.set_line_wrap(True)
+        self.status.set_selectable(True)
+        for w in (self.sys_check, self.mic_check, self.button, self.status):
+            box.pack_start(w, False, False, 0)
+        self.add(box)
+
+        self.button.connect("clicked", self.on_click)
+        self.connect("destroy", self.on_quit)
+
+        self.portal = ScreenCastPortal()
+        self.recorder = Recorder(self.on_done)
+
+        missing = [n for n in NEEDED if Gst.ElementFactory.find(n) is None]
+        if missing:
+            self.button.set_sensitive(False)
+            self.status.set_text("Missing GStreamer parts: " + ", ".join(missing))
+
+    def on_click(self, _button):
+        if self.recording:
+            self.button.set_sensitive(False)
+            self.status.set_text("Saving...")
+            self.recorder.stop()
+        else:
+            self.button.set_sensitive(False)
+            self.status.set_text("Choose what to share in the dialog...")
+            self.portal.start(self.on_stream, self.on_fail)
+
+    def on_stream(self, fd, node):
+        try:
+            self.recorder.start(fd, node, self.sys_check.get_active(),
+                                self.mic_check.get_active())
+        except GLib.Error as e:
+            return self.on_fail(e.message)
+        self.recording = True
+        self.seconds = 0
+        self.button.set_label("Stop recording")
+        self.button.set_sensitive(True)
+        self.sys_check.set_sensitive(False)
+        self.mic_check.set_sensitive(False)
+        self.timer_id = GLib.timeout_add_seconds(1, self.tick)
+        self.tick(first=True)
+
+    def tick(self, first=False):
+        if not first:
+            self.seconds += 1
+        m, s = divmod(self.seconds, 60)
+        self.status.set_text(f"Recording  {m:02d}:{s:02d}")
+        return self.recording
+
+    def on_fail(self, message):
+        self.portal.close()
+        self.reset_ui()
+        self.status.set_text(message)
+
+    def on_done(self, path, error):
+        self.portal.close()
+        self.reset_ui()
+        self.status.set_text(f"Error: {error}" if error else f"Saved to {path}")
+
+    def reset_ui(self):
+        self.recording = False
+        self.button.set_label("Start recording")
+        self.button.set_sensitive(True)
+        self.sys_check.set_sensitive(True)
+        self.mic_check.set_sensitive(True)
+
+    def on_quit(self, _w):
+        if self.recorder.pipeline:
+            self.recorder.pipeline.set_state(Gst.State.NULL)
+        self.portal.close()
+        Gtk.main_quit()
+
+
+App().show_all()
+Gtk.main()
